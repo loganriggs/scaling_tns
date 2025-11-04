@@ -1,18 +1,20 @@
 """
-Train transformer with torch.compile on GPU 1
+Train transformer with bfloat16 on GPU 0
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'  # Use GPU 1
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use GPU 0
 
 import torch
 import numpy as np
 import wandb
 import time
+import math
 from utils import (
-    ModelConfig, ToyTransformer, Trainer, TrainingConfig, count_parameters
+    ModelConfig, ToyTransformer, TrainingConfig, count_parameters
 )
 from dataloader import distributed_data_generator
+from torch.amp import autocast, GradScaler
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -23,7 +25,7 @@ n_layers = 12
 d_model = 64 * n_layers  # 768
 n_ctx = 256  # Must be >= seq_length for rotary embeddings
 n_head = 6
-batch_size = 32  # Reduced for larger 12-layer model
+batch_size = 32  # Same as float16 (bfloat16 has same memory footprint)
 seq_length = 256
 
 # Calculate iterations needed for 1B tokens
@@ -55,18 +57,18 @@ def get_batch_from_generator(data_gen, device='cuda'):
 
 
 print(f"\n{'='*60}")
-print(f"Training transformer WITH torch.compile")
+print(f"Training transformer with bfloat16")
 print(f"{'='*60}")
 
 # Initialize WandB
 wandb_run = wandb.init(
     project='scaling_tns',
-    name=f'transformer_float16_d{d_model}_n{n_layers}_binary',
+    name=f'transformer_d{d_model}_n{n_layers}_binary',
     config={
-        'model_name': 'transformer_float16',
+        'model_name': 'transformer',
         'squaring_attn': False,
         'bilinear': False,
-        'dtype': 'float16',
+        'dtype': 'bfloat16',
         'torch_compile': True,
         'compile_mode': 'max-autotune',
         'd_model': d_model,
@@ -96,13 +98,14 @@ model_config = ModelConfig(
 )
 
 # Create model
-model = ToyTransformer(model_config)
+model = ToyTransformer(model_config).to('cuda')
 params = count_parameters(model)
 print(f"Model parameters: {params['total']:,}")
+print(f"Using bfloat16 for better numerical stability")
 
 # Apply torch.compile
 print("\nCompiling model with torch.compile (mode='max-autotune')...")
-print("This will take 1-2 minutes on first iteration, then provide 15-30% speedup...")
+print("This will take 1-2 minutes on first iteration...")
 model = torch.compile(model, mode='max-autotune', fullgraph=False)
 print("Model compiled!")
 
@@ -121,30 +124,69 @@ training_config = TrainingConfig(
     log_interval=50
 )
 
-# Create trainer
-trainer = Trainer(model, training_config, device='cuda')
+# Import optimizer from utils
+from utils import Muon
 
-# Training loop
+# Setup optimizer
+optimizer = Muon(
+    model.parameters(),
+    lr=training_config.learning_rate,
+    momentum=training_config.momentum
+)
+scaler = GradScaler()
+
+# Training loop with bfloat16
 losses = []
 iterations = []
 start_time = time.time()
+iteration = 0
 
 for iter_num in range(max_iters):
     # Get batch from binary dataloader
     x, y = get_batch_from_generator(train_data_gen, device='cuda')
 
-    # Training step
-    loss, lr = trainer.train_step(x, attention_mask=None)
+    # Set learning rate with cosine schedule
+    if iteration < training_config.warmup_iters:
+        lr = training_config.learning_rate * iteration / training_config.warmup_iters
+    elif iteration > training_config.lr_decay_iters:
+        lr = training_config.min_lr
+    else:
+        decay_ratio = (iteration - training_config.warmup_iters) / (training_config.lr_decay_iters - training_config.warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        lr = training_config.min_lr + coeff * (training_config.learning_rate - training_config.min_lr)
+
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+    optimizer.zero_grad()
+
+    # Forward pass with bfloat16 AMP
+    with autocast(device_type="cuda", dtype=torch.bfloat16):
+        _, loss = model(x, attention_mask=None)
+
+    # Backward pass
+    scaler.scale(loss).backward()
+
+    # Gradient clipping
+    if training_config.grad_clip > 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.grad_clip)
+
+    # Optimizer step
+    scaler.step(optimizer)
+    scaler.update()
+
+    iteration += 1
 
     # Log
     if iter_num % 50 == 0 or iter_num == max_iters - 1:
-        losses.append(loss)
+        losses.append(loss.item())
         iterations.append(iter_num * tokens_per_batch)
         elapsed_time = time.time() - start_time
 
         # Log to WandB
         wandb.log({
-            "loss": loss,
+            "loss": loss.item(),
             "lr": lr,
             "step": iter_num,
             "tokens": iter_num * tokens_per_batch,
@@ -152,7 +194,7 @@ for iter_num in range(max_iters):
         })
 
         if iter_num % 200 == 0:
-            print(f"Iter {iter_num}/{max_iters} | Loss: {loss:.4f} | LR: {lr:.6f} | Time: {elapsed_time:.1f}s | Tokens: {iter_num * tokens_per_batch / 1e6:.1f}M")
+            print(f"Iter {iter_num}/{max_iters} | Loss: {loss.item():.4f} | LR: {lr:.6f} | Time: {elapsed_time:.1f}s | Tokens: {iter_num * tokens_per_batch / 1e6:.1f}M")
 
 print(f"Final loss: {losses[-1]:.4f}")
 
